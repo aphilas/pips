@@ -2,10 +2,7 @@ module github.com/aphilas/pips
 
 go 1.20
 
-require (
-	github.com/urfave/cli/v2 v2.24.4
-	golang.org/x/exp v0.0.0-20230304125523-9ff063c70017
-)
+require github.com/urfave/cli/v2 v2.24.4
 
 require (
 	github.com/cpuguy83/go-md2man/v2 v2.0.2 // indirect
