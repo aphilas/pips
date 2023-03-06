@@ -11,7 +11,7 @@ If you're lost, you are probably looking for [Poetry](https://python-poetry.org/
 ```sh
 git clone https://github.com/aphilas/pips.git
 cd pips
-go build -o /usr/local/bin/pips .
+go install
 pips --help
 ```
 
@@ -35,3 +35,9 @@ cat requirements.txt
 ## Motivation
 
 I don't (yet) need Poetry. I had a [bash function](https://gist.githubusercontent.com/aphilas/6bf28a7bb71a66f2a974d27e1ca3ff30/raw/8df298268915294746e19e918ee2becf62586743/pips.sh) to do this that was getting unwieldy.
+
+## Gotchas
+
+- pips only parses and saves requirements specifiers with the `==` version specifier
+- pips preserves the user-supplied extras name
+- pips [normalizes](https://peps.python.org/pep-0503/#normalized-names) the package name

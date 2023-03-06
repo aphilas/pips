@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -25,13 +28,13 @@ type PackageSpec struct {
 }
 
 var (
-	extrasRgx *regexp.Regexp
+	// TODO: Match python spec - https://peps.python.org/pep-0508/#names
+	// See name regexp - https://peps.python.org/pep-0508/#names
+	extrasRgx    *regexp.Regexp = regexp.MustCompile(`\[(?:[^\d\W]\w*)(?:,[^\d\W]\w*)*\]`)
+	normalizeRgx *regexp.Regexp = regexp.MustCompile(`[-_.]+`)
 )
 
 func main() {
-	// TODO: Match python spec
-	extrasRgx = regexp.MustCompile(`\[(?:[^\d\W]\w*)(?:,[^\d\W]\w*)*\]`)
-
 	app := &cli.App{
 		Name:  "pips",
 		Usage: "install pip packages and add to requirements.txt",
@@ -48,13 +51,49 @@ func main() {
 						Usage:   "save to " + DEV_REQS_PATH,
 					},
 				},
-				Action: InstallCmd,
+				Action: installCmd,
+			},
+			{
+				Name:    "save",
+				Aliases: []string{"s"},
+				Usage:   "saves an installed package to " + REQS_PATH,
+				Flags: []cli.Flag{
+					&cli.BoolFlag{
+						Name:    "dev",
+						Aliases: []string{"d"},
+						Value:   false,
+						Usage:   "save to " + DEV_REQS_PATH,
+					},
+				},
+				Action: saveCmd,
 			},
 			{
 				Name:    "uninstall",
 				Aliases: []string{"remove", "rm", "u"},
-				Usage:   "uninstalls a package",
-				Action:  UninstallCmd,
+				Usage:   "uninstalls a package and updates " + REQS_PATH,
+				Flags: []cli.Flag{
+					&cli.BoolFlag{
+						Name:    "dev",
+						Aliases: []string{"d"},
+						Value:   false,
+						Usage:   "remove from " + DEV_REQS_PATH,
+					},
+				},
+				Action: uninstallCmd,
+			},
+			{
+				Name:    "delete",
+				Aliases: []string{"d"},
+				Usage:   "deletes a package from " + REQS_PATH,
+				Flags: []cli.Flag{
+					&cli.BoolFlag{
+						Name:    "dev",
+						Aliases: []string{"d"},
+						Value:   false,
+						Usage:   "delete from " + DEV_REQS_PATH,
+					},
+				},
+				Action: unsaveCmd,
 			},
 		},
 	}
@@ -66,17 +105,16 @@ func main() {
 	}
 }
 
-func InstallCmd(ctx *cli.Context) error {
+func installCmd(ctx *cli.Context) error {
 	if ctx.Args().Len() < 1 {
 		return fmt.Errorf("got 0 arguments")
 	}
 
-	// Install packages
+	args := ctx.Args().Slice()
+	execArgs := []string{"-m", "pip", "install"}
+	execArgs = append(execArgs, args...)
 
-	args := []string{"-m", "pip", "install"}
-	args = append(args, ctx.Args().Slice()...)
-
-	cmd := exec.Command("python", args...)
+	cmd := exec.Command("python", execArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -85,23 +123,27 @@ func InstallCmd(ctx *cli.Context) error {
 		return err
 	}
 
-	// Add to [dev-]requirements.txt
-
-	pkgExtras := map[string]string{}
-	pkgs := []string{}
-	for _, arg := range ctx.Args().Slice() {
-		if strings.Contains(arg, "[") {
-			name := NormalizePkgName(extrasRgx.ReplaceAllLiteralString(arg, ""))
-			pkgs = append(pkgs, name)
-			pkgExtras[name] = extrasRgx.FindString(arg)
-		} else {
-			pkgs = append(pkgs, arg)
-		}
+	path := REQS_PATH
+	if ctx.Bool("dev") {
+		path = DEV_REQS_PATH
 	}
 
-	inspection, err := PipInspect()
+	inspection, err := pipInspect()
 	if err != nil {
 		return err
+	}
+
+	pkgs := parseArgs(args)
+	if err := savePkgs(path, inspection, pkgs); err != nil {
+		fmt.Println(err)
+	}
+
+	return nil
+}
+
+func saveCmd(ctx *cli.Context) error {
+	if ctx.Args().Len() < 1 {
+		return fmt.Errorf("got 0 arguments")
 	}
 
 	path := REQS_PATH
@@ -109,54 +151,25 @@ func InstallCmd(ctx *cli.Context) error {
 		path = DEV_REQS_PATH
 	}
 
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
+	inspection, err := pipInspect()
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	defer func() {
-		if err := f.Close(); err != nil {
-			log.Fatal(err)
-		}
-	}()
 
-	for _, p := range pkgs {
-		var item *InspectReportItem
-
-		// TODO: Improve perf
-		for _, it := range inspection.Installed {
-			if NormalizePkgName(it.Metadata.Name) == p {
-				item = &it
-			}
-		}
-
-		if item == nil {
-			fmt.Printf("package %s not found\n", p)
-			continue
-		}
-
-		extras := ""
-		if v, ok := pkgExtras[p]; ok {
-			extras = v
-		} else if len(item.Metadata.ProvidesExtra) > 0 {
-			extras = fmt.Sprintf("[%s]", strings.Join(item.Metadata.ProvidesExtra, ","))
-		}
-
-		_, err := f.WriteString(fmt.Sprintf("%s%s==%s\n", p, extras, item.Metadata.Version))
-		if err != nil {
-			fmt.Printf("could not add %s to %s: %v\n", p, path, err)
-			continue
-		}
+	pkgs := parseArgs(ctx.Args().Slice())
+	if err := savePkgs(path, inspection, pkgs); err != nil {
+		return err
 	}
 
 	return nil
 }
 
-func UninstallCmd(ctx *cli.Context) error {
+// TODO: Skip truncating requirements file
+// if uninstall fails
+func uninstallCmd(ctx *cli.Context) error {
 	if ctx.Args().Len() < 1 {
 		return fmt.Errorf("got 0 arguments")
 	}
-
-	// Uninstall packages
 
 	args := []string{"-m", "pip", "uninstall"}
 	args = append(args, ctx.Args().Slice()...)
@@ -170,18 +183,45 @@ func UninstallCmd(ctx *cli.Context) error {
 		return err
 	}
 
+	path := REQS_PATH
+	if ctx.Bool("dev") {
+		path = DEV_REQS_PATH
+	}
+
+	pkgs := parseArgs(ctx.Args().Slice())
+	if err := removePkgs(path, pkgs); err != nil {
+		return err
+	}
+
 	return nil
 }
 
-// PipInsect runs pip inspect
+func unsaveCmd(ctx *cli.Context) error {
+	if ctx.Args().Len() < 1 {
+		return fmt.Errorf("got 0 arguments")
+	}
+
+	path := REQS_PATH
+	if ctx.Bool("dev") {
+		path = DEV_REQS_PATH
+	}
+
+	pkgs := parseArgs(ctx.Args().Slice())
+	if err := removePkgs(path, pkgs); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// pipInsect runs pip inspect
 // and decodes the output.
-func PipInspect() (*PipInspection, error) {
+func pipInspect() (*PipInspection, error) {
 	var stdout bytes.Buffer
 
+	// Run pip inspect. Ignore stderr and block stdin.
 	cmd := exec.Command("python", "-m", "pip", "inspect")
-	// cmd.Stdin = os.Stdin
 	cmd.Stdout = &stdout
-	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
 		return nil, err
@@ -196,24 +236,156 @@ func PipInspect() (*PipInspection, error) {
 	return pi, nil
 }
 
-// RunCommand runs exec.Command
-// and returns buffers containing stdout and stderr.
-func RunCommand(name string, arg ...string) (stdout, stderr bytes.Buffer, err error) {
-	cmd := exec.Command("python", arg...)
+// parseArgs parses a list of requirement specifiers
+// returning a map of normalizedName -> extras.
+func parseArgs(specifiers []string) map[string]string {
+	pkgs := map[string]string{}
 
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err = cmd.Run(); err != nil {
-		return
+	for _, arg := range specifiers {
+		name, extras, _ := parseSpecifier(arg)
+		pkgs[name] = extras
 	}
 
-	return
+	return pkgs
 }
 
-// NormalizePkgName attempts to normalize
-// a PyPi package name.
-// TODO: Follow spec
-func NormalizePkgName(name string) string {
-	return strings.ReplaceAll(strings.ToLower(name), "_", "-")
+// parseSpecifier parses a requirement specifier
+// in the format packageName[extra1,extra2]==0.0.1
+// naively to return package-name,[extras],versionspecifier.
+// TODO: Parse version specifiers.
+// See PEP508 - https://peps.python.org/pep-0508/.
+func parseSpecifier(s string) (string, string, string) {
+	var name, extras, version string
+
+	if s == "" {
+		return "", "", ""
+	}
+
+	splt := strings.SplitN(s, "==", 2)
+	if len(splt) > 1 {
+		version = splt[1]
+	}
+
+	ne := splt[0]
+	if strings.Contains(ne, "[") {
+		loc := extrasRgx.FindStringIndex(s)
+		if loc != nil {
+			extras = ne[loc[0]:loc[1]]
+			name = normalizePkgName(ne[:loc[0]])
+		}
+	} else {
+		name = normalizePkgName(ne)
+	}
+
+	return name, extras, version
+}
+
+// removePkgs deletes all lines in the requirements file specified by path
+// which are requirements specifications for any package in pkgs.
+func removePkgs(path string, pkgs map[string]string) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_RDWR, 0666)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	var buf bytes.Buffer
+	var e error
+	scanner := bufio.NewScanner(f)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		name, _, _ := parseSpecifier(line)
+		if _, ok := pkgs[name]; !ok {
+			_, err := buf.Write(scanner.Bytes())
+			if err != nil {
+				e = errors.Join(err, err)
+				continue
+			}
+			_, err = buf.WriteString("\n")
+			if err != nil {
+				e = errors.Join(err, err)
+				continue
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return errors.Join(err, e)
+	}
+
+	f.Truncate(0)
+	f.Seek(0, io.SeekStart)
+	_, err = io.Copy(f, &buf)
+	if err != nil {
+		return errors.Join(err, e)
+	}
+
+	return e
+}
+
+// savePkgs adds pkgs to a requirements file.
+func savePkgs(path string, inspection *PipInspection, pkgs map[string]string) error {
+	var e error
+
+	inspHash := make(map[string]*InspectReportItem)
+	for i, it := range inspection.Installed {
+		inspHash[normalizePkgName(it.Metadata.Name)] = &inspection.Installed[i]
+	}
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0666)
+	if err != nil {
+		log.Fatal(e)
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	dups := make(map[string]bool)
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		name, _, _ := parseSpecifier(line)
+		if _, ok := pkgs[name]; ok {
+			dups[name] = true
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return errors.Join(err, err)
+	}
+
+	for p, extras := range pkgs {
+		item, ok := inspHash[p]
+		if !ok {
+			e = errors.Join(e, fmt.Errorf("package %s not found", p))
+			continue
+		}
+
+		if dup := dups[p]; dup {
+			e = errors.Join(e, fmt.Errorf("package %s duplicate found", p))
+		} else {
+			_, err := f.WriteString(fmt.Sprintf("%s%s==%s\n", p, extras, item.Metadata.Version))
+			if err != nil {
+				errors.Join(err, fmt.Errorf("could not add %s to %s: %v", p, path, err))
+				continue
+			}
+		}
+	}
+
+	return e
+}
+
+// normalizePkgName normalizes a package name.
+// See - https://peps.python.org/pep-0503/#normalized-names.
+// Regex test - https://go.dev/play/p/4SazgOPaJmm
+func normalizePkgName(name string) string {
+	return strings.ToLower(normalizeRgx.ReplaceAllLiteralString(name, "-"))
 }
